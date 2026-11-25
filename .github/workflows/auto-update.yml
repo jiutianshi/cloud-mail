@@ -1,0 +1,139 @@
+name: Cloud Mail 自动更新
+
+on:
+  schedule:
+    # 每天 UTC 18:00（北京时间 02:00）检查一次上游
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudmail-update
+  cancel-in-progress: false
+
+env:
+  NAME: cloud-mail
+  SITE_DOMAIN: ninenine.ccwu.cc
+  MAIL_ROUTE: mail.ninenine.ccwu.cc
+  ZONE_ID: 6d626a10957be0d5d0ba8f08944d566b
+  DOMAINS: '["ninenine.ccwu.cc"]'
+  ADMIN: admin@ninenine.ccwu.cc
+  D1_DATABASE_ID: 636f0609-ab73-428b-aa97-01cf6fc9e3b3
+  KV_NAMESPACE_ID: 1eb586b53a6144df921b221d3c4c7ac1
+  AI_MODEL: '@cf/meta/llama-3.1-8b-instruct-fast'
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      CI: 'true'
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 同步上游代码
+        id: sync
+        run: |
+          set -e
+          git config user.name "cloudmail-bot"
+          git config user.email "cloudmail-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/maillab/cloud-mail.git 2>/dev/null || true
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游没有新提交"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --no-edit upstream/main
+            echo "已合并上游新提交：$(git log -1 --format=%h)"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 pnpm
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: 安装 Node
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 生成部署配置
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          cd mail-worker
+          cp wrangler-action.toml deploy.toml
+          sed -i "s|\${NAME}|${NAME}|g" deploy.toml
+          sed -i "s|\${CUSTOM_DOMAIN}|${SITE_DOMAIN}|g" deploy.toml
+          sed -i "s|\"\${DOMAIN}\"|${DOMAINS}|g" deploy.toml
+          sed -i "s|\${ADMIN}|${ADMIN}|g" deploy.toml
+          sed -i "s|\${PASSWORD}|cloudmail|g" deploy.toml
+          sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" deploy.toml
+          sed -i "s|\${AI_MODEL}|${AI_MODEL}|g" deploy.toml
+          sed -i "s|\${ANALYSIS_CACHE}|false|g" deploy.toml
+          sed -i "s|\${PROJECT_LINK}|false|g" deploy.toml
+          sed -i "s|\${D1_DATABASE_ID}|${D1_DATABASE_ID}|g" deploy.toml
+          sed -i "s|\${KV_NAMESPACE_ID}|${KV_NAMESPACE_ID}|g" deploy.toml
+          sed -i '/\[\[r2_buckets\]\]/,/^$/d' deploy.toml
+          cat >> deploy.toml <<EOF
+
+          [[routes]]
+          pattern = "${MAIL_ROUTE}"
+          zone_name = "${SITE_DOMAIN}"
+          EOF
+          echo "--- 部署配置中的路由 ---"
+          grep -n "pattern\|custom_domain" deploy.toml
+
+      - name: 安装依赖并部署
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          cd mail-worker
+          pnpm install --frozen-lockfile
+          pnpm wrangler deploy -c deploy.toml
+
+      - name: 升级数据库
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          for i in 1 2 3; do
+            R=$(curl -sS -m 90 "https://${SITE_DOMAIN}/api/init/${JWT_SECRET}" || true)
+            echo "第 $i 次 init 返回：$R"
+            if [ "$R" = "success" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "数据库升级失败"; exit 1
+
+      - name: 确保收信路由与占位解析存在
+        if: steps.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -e
+          AUTH="Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+          if ! curl -s -H "$AUTH" "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" | grep -q "${MAIL_ROUTE}"; then
+            echo "补建收信路由"
+            curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              -d "{\"pattern\":\"${MAIL_ROUTE}\",\"script\":\"${NAME}\"}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" > /dev/null
+          fi
+          if ! curl -s -H "$AUTH" "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${MAIL_ROUTE}" | grep -q '"type":"AAAA"'; then
+            echo "补建占位解析"
+            curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+              -d "{\"type\":\"AAAA\",\"name\":\"${MAIL_ROUTE}\",\"content\":\"100::\",\"proxied\":true,\"ttl\":1}" \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records" > /dev/null
+          fi
+          echo "路由与解析检查完成"
+
+      - name: 同步回仓库
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          git push origin HEAD:main
+          echo "fork 的 main 已同步到 $(git log -1 --format=%h)"
