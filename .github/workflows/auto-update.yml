@@ -17,6 +17,7 @@ env:
   NAME: cloud-mail
   SITE_DOMAIN: ninenine.ccwu.cc
   MAIL_ROUTE: mail.ninenine.ccwu.cc
+  ROUTE_PATTERN: mail.ninenine.ccwu.cc/*
   ZONE_ID: 6d626a10957be0d5d0ba8f08944d566b
   DOMAINS: '["ninenine.ccwu.cc"]'
   ADMIN: admin@ninenine.ccwu.cc
@@ -88,7 +89,7 @@ jobs:
           cat >> deploy.toml <<EOF
 
           [[routes]]
-          pattern = "${MAIL_ROUTE}"
+          pattern = "${ROUTE_PATTERN}"
           zone_name = "${SITE_DOMAIN}"
           EOF
           echo "--- 部署配置中的路由 ---"
@@ -118,10 +119,10 @@ jobs:
         run: |
           set -e
           AUTH="Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
-          if ! curl -s -H "$AUTH" "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" | grep -q "${MAIL_ROUTE}"; then
+          if ! curl -s -H "$AUTH" "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" | grep -qF "${ROUTE_PATTERN}"; then
             echo "补建收信路由"
             curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-              -d "{\"pattern\":\"${MAIL_ROUTE}\",\"script\":\"${NAME}\"}" \
+              -d "{\"pattern\":\"${ROUTE_PATTERN}\",\"script\":\"${NAME}\"}" \
               "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" > /dev/null
           fi
           if ! curl -s -H "$AUTH" "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/dns_records?name=${MAIL_ROUTE}" | grep -q '"type":"AAAA"'; then
